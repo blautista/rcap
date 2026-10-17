@@ -2,7 +2,9 @@
 
 mod capture;
 mod clipboard;
+mod draw;
 mod encode;
+mod layout;
 mod recent;
 
 use std::cell::{Cell, RefCell};
@@ -23,21 +25,9 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use capture::Region;
+use draw::{Fonts, KEY};
+use layout::{scale, DEFAULT_FPS};
 
-// Frame metrics at 96 DPI. We draw our own frame: color-key hit-testing is
-// unreliable with the system frame, and a window region (what LICEcap uses)
-// makes the window flicker transparent during live resize. DWM still adds the
-// Windows 11 rounded corners, shadow and border.
-const TITLEBAR: i32 = 32;
-const BORDER: i32 = 6;
-const TOOLBAR: i32 = 44;
-const GRIP: i32 = 12;
-const CLOSE_W: i32 = 46;
-const CONTROL_H: i32 = 28;
-const RADIUS: i32 = 4;
-const DEFAULT_FPS: u32 = 30;
-const MIN_FPS: i32 = 10;
-const MAX_FPS: i32 = 60;
 const DEFAULT_SIZE: (i32, i32) = (640, 360);
 
 const ID_REC: u32 = 101;
@@ -53,29 +43,6 @@ const MENU_CLEAR: usize = 2001;
 const TIMER: usize = 1;
 const WM_DONE: u32 = WM_APP + 1;
 
-const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    r as u32 | (g as u32) << 8 | (b as u32) << 16
-}
-
-// Windows 11 light palette.
-const BG: COLORREF = rgb(243, 243, 243);
-const TEXT: COLORREF = rgb(26, 26, 26);
-const SUBTLE: COLORREF = rgb(96, 96, 96);
-const STROKE: COLORREF = rgb(229, 229, 229);
-const HOLE_STROKE: COLORREF = rgb(200, 200, 200);
-const FIELD: COLORREF = rgb(255, 255, 255);
-const FIELD_OFF: COLORREF = rgb(249, 249, 249);
-const FIELD_LINE: COLORREF = rgb(134, 134, 134);
-const ACCENT: COLORREF = rgb(0, 95, 184);
-const RED: COLORREF = rgb(196, 43, 28);
-const RED_HOT: COLORREF = rgb(212, 62, 48);
-const RED_DOWN: COLORREF = rgb(168, 36, 24);
-const BTN: COLORREF = rgb(251, 251, 251);
-const BTN_HOT: COLORREF = rgb(246, 246, 246);
-const BTN_DOWN: COLORREF = rgb(240, 240, 240);
-const OFF: COLORREF = rgb(229, 229, 229);
-const OFF_TEXT: COLORREF = rgb(140, 140, 140);
-
 type EncodeResult = Result<(PathBuf, u64), String>;
 
 #[derive(Clone, Copy)]
@@ -86,22 +53,9 @@ struct Ui {
     w: HWND,
     h: HWND,
     recent: HWND,
-    font: HFONT,
-    icon_font: HFONT,
+    fonts: Fonts,
     text_h: i32,
     field_off: HBRUSH,
-    dpi: u32,
-}
-
-/// Rects of the toolbar items, in client coordinates.
-struct Toolbar {
-    rec: RECT,
-    fps_label: RECT,
-    fps: RECT,
-    w: RECT,
-    x_label: RECT,
-    h: RECT,
-    recent: RECT,
 }
 
 enum State {
@@ -137,20 +91,12 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-fn scale(v: i32, dpi: u32) -> i32 {
-    v * dpi as i32 / 96
-}
-
 fn style() -> u32 {
     // WS_THICKFRAME is required for edge resizing; WM_NCCALCSIZE hides its border.
     WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN | WS_SYSMENU | WS_MINIMIZEBOX
 }
 
 const EX_STYLE: u32 = WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_LAYERED;
-/// The hole is painted this color, which the layered window makes see-through
-/// and click-through. Capture uses BitBlt without CAPTUREBLT, which skips
-/// layered windows, so the recording shows what's underneath.
-const KEY: COLORREF = 0x00FF00FF;
 
 fn main() {
     unsafe {
@@ -199,33 +145,19 @@ fn main() {
         };
         DwmExtendFrameIntoClientArea(hwnd, &m);
 
-        let dpi = GetDpiForWindow(hwnd);
         let edit = WS_TABSTOP | ES_NUMBER as u32 | ES_CENTER as u32;
-        let font = make_font(dpi);
+        let button = WS_TABSTOP | BS_PUSHBUTTON as u32;
+        let fonts = Fonts::new(GetDpiForWindow(hwnd));
         let u = Ui {
             hwnd,
-            rec: child(
-                hwnd,
-                "BUTTON",
-                "●  Record",
-                WS_TABSTOP | BS_PUSHBUTTON as u32,
-                ID_REC,
-            ),
+            rec: child(hwnd, "BUTTON", "●  Record", button, ID_REC),
             fps: child(hwnd, "EDIT", &DEFAULT_FPS.to_string(), edit, ID_FPS),
             w: child(hwnd, "EDIT", "", edit, ID_W),
             h: child(hwnd, "EDIT", "", edit, ID_H),
-            recent: child(
-                hwnd,
-                "BUTTON",
-                "Recent",
-                WS_TABSTOP | BS_PUSHBUTTON as u32,
-                ID_RECENT,
-            ),
-            font,
-            icon_font: make_icon_font(dpi),
-            text_h: text_height(font),
-            field_off: CreateSolidBrush(FIELD_OFF),
-            dpi,
+            recent: child(hwnd, "BUTTON", "Recent", button, ID_RECENT),
+            fonts,
+            text_h: fonts.text_height(),
+            field_off: CreateSolidBrush(draw::FIELD_OFF),
         };
         UI.with(|c| c.set(Some(u)));
         apply_font(&u);
@@ -264,52 +196,9 @@ unsafe fn child(parent: HWND, class: &str, text: &str, style: u32, id: u32) -> H
     )
 }
 
-unsafe fn make_font(dpi: u32) -> HFONT {
-    let mut ncm: NONCLIENTMETRICSW = mem::zeroed();
-    ncm.cbSize = mem::size_of::<NONCLIENTMETRICSW>() as u32;
-    SystemParametersInfoForDpi(
-        SPI_GETNONCLIENTMETRICS,
-        ncm.cbSize,
-        &mut ncm as *mut _ as *mut _,
-        0,
-        dpi,
-    );
-    CreateFontIndirectW(&ncm.lfMessageFont)
-}
-
-/// Icon font for the close glyph (present on Windows 10 and 11).
-unsafe fn make_icon_font(dpi: u32) -> HFONT {
-    CreateFontW(
-        -scale(10, dpi),
-        0,
-        0,
-        0,
-        FW_NORMAL as _,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET as _,
-        OUT_DEFAULT_PRECIS as _,
-        CLIP_DEFAULT_PRECIS as _,
-        CLEARTYPE_QUALITY as _,
-        0,
-        wide("Segoe MDL2 Assets").as_ptr(),
-    )
-}
-
-unsafe fn text_height(font: HFONT) -> i32 {
-    let dc = GetDC(ptr::null_mut());
-    let old = SelectObject(dc, font);
-    let mut tm: TEXTMETRICW = mem::zeroed();
-    GetTextMetricsW(dc, &mut tm);
-    SelectObject(dc, old);
-    ReleaseDC(ptr::null_mut(), dc);
-    tm.tmHeight
-}
-
 unsafe fn apply_font(u: &Ui) {
     for c in [u.rec, u.fps, u.w, u.h, u.recent] {
-        SendMessageW(c, WM_SETFONT, u.font as WPARAM, 1);
+        SendMessageW(c, WM_SETFONT, u.fonts.text as WPARAM, 1);
     }
 }
 
@@ -323,111 +212,50 @@ unsafe fn set_text(h: HWND, s: &str) {
     SetWindowTextW(h, wide(s).as_ptr());
 }
 
-unsafe fn get_num(h: HWND) -> Option<i32> {
-    get_text(h).trim().parse().ok()
-}
-
-/// FPS field value clamped to MIN_FPS..=MAX_FPS; rewrites the field if it was out of range.
+/// The FPS field's value, clamped; rewrites the field if it was out of range.
 unsafe fn read_fps(u: &Ui) -> u32 {
-    let fps = get_num(u.fps)
-        .unwrap_or(DEFAULT_FPS as i32)
-        .clamp(MIN_FPS, MAX_FPS);
+    let fps = layout::parse_fps(&get_text(u.fps));
     set_text(u.fps, &fps.to_string());
-    fps as u32
+    fps
 }
 
-/// Largest window that fits the (multi-monitor) virtual screen.
-unsafe fn max_window() -> POINT {
-    POINT {
-        x: GetSystemMetrics(SM_CXVIRTUALSCREEN),
-        y: GetSystemMetrics(SM_CYVIRTUALSCREEN),
-    }
+/// The (multi-monitor) virtual screen size.
+unsafe fn screen_size() -> (i32, i32) {
+    (
+        GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        GetSystemMetrics(SM_CYVIRTUALSCREEN),
+    )
 }
 
 /// Resize the window so the see-through hole is exactly w x h physical pixels.
 unsafe fn set_capture_size(w: i32, h: i32) {
     let Some(u) = ui() else { return };
-    let s = |v| scale(v, u.dpi);
+    let (ww, wh) = layout::window_for_hole(u.fonts.dpi, w, h);
     SetWindowPos(
         u.hwnd,
         ptr::null_mut(),
         0,
         0,
-        w + s(BORDER) * 2,
-        h + s(TITLEBAR) + s(TOOLBAR),
+        ww,
+        wh,
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
 }
 
-unsafe fn client_rect(hwnd: HWND) -> RECT {
+/// Client (== window) size.
+unsafe fn client_size(hwnd: HWND) -> (i32, i32) {
     let mut rc: RECT = mem::zeroed();
     GetClientRect(hwnd, &mut rc);
-    rc
+    (rc.right, rc.bottom)
 }
 
-/// The see-through capture area, in client coordinates.
-unsafe fn hole_rect(u: &Ui) -> RECT {
-    let rc = client_rect(u.hwnd);
-    hole_for(u.dpi, rc.right, rc.bottom)
-}
-
-/// Hole for a window of the given size (client area == whole window).
-fn hole_for(dpi: u32, w: i32, h: i32) -> RECT {
-    let s = |v| scale(v, dpi);
-    RECT {
-        left: s(BORDER),
-        top: s(TITLEBAR),
-        right: (w - s(BORDER)).max(s(BORDER)),
-        bottom: (h - s(TOOLBAR)).max(s(TITLEBAR)),
-    }
-}
-
-fn close_rect(u: &Ui, rc: &RECT) -> RECT {
-    RECT {
-        left: rc.right - scale(CLOSE_W, u.dpi),
-        top: 0,
-        right: rc.right,
-        bottom: scale(TITLEBAR, u.dpi),
-    }
-}
-
-fn toolbar(u: &Ui, rc: &RECT) -> Toolbar {
-    let s = |v| scale(v, u.dpi);
-    let h = s(CONTROL_H);
-    let top = rc.bottom - s(TOOLBAR) + (s(TOOLBAR) - h) / 2;
-    let mut x = s(BORDER);
-    let mut next = |w: i32, gap: i32| {
-        let r = RECT {
-            left: x,
-            top,
-            right: x + s(w),
-            bottom: top + h,
-        };
-        x += s(w) + s(gap);
-        r
-    };
-    Toolbar {
-        rec: next(96, 16),
-        fps_label: next(24, 6),
-        fps: next(40, 16),
-        w: next(56, 0),
-        x_label: next(18, 0),
-        h: next(56, 0),
-        recent: RECT {
-            left: rc.right - s(BORDER) - s(92),
-            top,
-            right: rc.right - s(BORDER),
-            bottom: top + h,
-        },
-    }
-}
-
-fn contains(r: &RECT, x: i32, y: i32) -> bool {
-    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+unsafe fn close_rect(u: &Ui) -> RECT {
+    layout::close_button(u.fonts.dpi, client_size(u.hwnd).0)
 }
 
 unsafe fn capture_region(u: &Ui) -> Region {
-    let r = hole_rect(u);
+    let (w, h) = client_size(u.hwnd);
+    let r = layout::hole(u.fonts.dpi, w, h);
     let mut origin = POINT {
         x: r.left,
         y: r.top,
@@ -443,8 +271,9 @@ unsafe fn capture_region(u: &Ui) -> Region {
 
 unsafe fn layout() {
     let Some(u) = ui() else { return };
-    let rc = client_rect(u.hwnd);
-    let tb = toolbar(&u, &rc);
+    let (w, h) = client_size(u.hwnd);
+    let dpi = u.fonts.dpi;
+    let tb = layout::toolbar(dpi, w, h);
     let mut dwp = BeginDeferWindowPos(5);
     let mut place = |c: HWND, r: &RECT| {
         dwp = DeferWindowPos(
@@ -460,19 +289,9 @@ unsafe fn layout() {
     };
     place(u.rec, &tb.rec);
     place(u.recent, &tb.recent);
-    // Borderless edits sit inside field boxes painted by us, vertically centered.
-    let pad = scale(4, u.dpi);
+    // Borderless edits sit inside field boxes painted by us.
     for (c, r) in [(u.fps, &tb.fps), (u.w, &tb.w), (u.h, &tb.h)] {
-        let top = r.top + (r.bottom - r.top - u.text_h) / 2;
-        place(
-            c,
-            &RECT {
-                left: r.left + pad,
-                top,
-                right: r.right - pad,
-                bottom: top + u.text_h,
-            },
-        );
+        place(c, &layout::edit_in_field(dpi, r, u.text_h));
     }
     EndDeferWindowPos(dwp);
 
@@ -495,134 +314,37 @@ unsafe fn layout() {
     );
 }
 
-unsafe fn fill(hdc: HDC, r: &RECT, color: COLORREF) {
-    let b = CreateSolidBrush(color);
-    FillRect(hdc, r, b);
-    DeleteObject(b);
-}
-
-unsafe fn round_rect(hdc: HDC, r: &RECT, radius: i32, fill: COLORREF, stroke: COLORREF) {
-    let brush = CreateSolidBrush(fill);
-    let pen = CreatePen(PS_SOLID, 1, stroke);
-    let (ob, op) = (SelectObject(hdc, brush), SelectObject(hdc, pen));
-    RoundRect(
-        hdc,
-        r.left,
-        r.top,
-        r.right,
-        r.bottom,
-        radius * 2,
-        radius * 2,
-    );
-    SelectObject(hdc, ob);
-    SelectObject(hdc, op);
-    DeleteObject(brush);
-    DeleteObject(pen);
-}
-
-unsafe fn text(hdc: HDC, s: &str, r: &RECT, color: COLORREF, flags: DRAW_TEXT_FORMAT) {
-    let w: Vec<u16> = s.encode_utf16().collect();
-    let mut r = *r;
-    SetBkMode(hdc, TRANSPARENT as i32);
-    SetTextColor(hdc, color);
-    DrawTextW(
-        hdc,
-        w.as_ptr(),
-        w.len() as i32,
-        &mut r,
-        flags | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-    );
-}
-
 unsafe fn paint(hwnd: HWND) {
     let Some(u) = ui() else { return };
     let mut ps: PAINTSTRUCT = mem::zeroed();
     let screen_dc = BeginPaint(hwnd, &mut ps);
-    let rc = client_rect(hwnd);
-    let s = |v| scale(v, u.dpi);
+    let (w, h) = client_size(hwnd);
     // Draw off-screen and blit once: the compositor can grab a frame mid-paint,
     // and a frame-colored fill caught before the hole is keyed out shows up as
     // gray bands in the hole during resize.
     let hdc = CreateCompatibleDC(screen_dc);
-    let bmp = CreateCompatibleBitmap(screen_dc, rc.right, rc.bottom);
+    let bmp = CreateCompatibleBitmap(screen_dc, w, h);
     let old_bmp = SelectObject(hdc, bmp);
-    let old_font = SelectObject(hdc, u.font);
-    fill(hdc, &rc, BG);
 
-    let hole = hole_rect(&u);
-    fill(hdc, &hole, KEY);
-    let outline = RECT {
-        left: hole.left - 1,
-        top: hole.top - 1,
-        right: hole.right + 1,
-        bottom: hole.bottom + 1,
-    };
-    let stroke = CreateSolidBrush(HOLE_STROKE);
-    FrameRect(hdc, &outline, stroke);
-    DeleteObject(stroke);
-
-    // Title bar.
-    let close = close_rect(&u, &rc);
-    let title = get_text(hwnd);
-    let title_rc = RECT {
-        left: s(12),
-        top: 0,
-        right: close.left - s(8),
-        bottom: s(TITLEBAR),
-    };
-    text(
-        hdc,
-        &title,
-        &title_rc,
-        if recording() { RED } else { TEXT },
-        DT_END_ELLIPSIS,
-    );
-    let (hot, down) = CLOSE.with(|c| c.get());
-    if hot {
-        fill(hdc, &close, if down { RED_DOWN } else { RED });
-    }
-    SelectObject(hdc, u.icon_font);
-    text(
-        hdc,
-        "\u{E8BB}",
-        &close,
-        if hot { FIELD } else { TEXT },
-        DT_CENTER,
-    );
-    SelectObject(hdc, u.font);
-
-    // Toolbar: labels and the boxes the borderless edits sit in.
-    let tb = toolbar(&u, &rc);
-    text(hdc, "FPS", &tb.fps_label, SUBTLE, DT_RIGHT);
-    text(hdc, "×", &tb.x_label, SUBTLE, DT_CENTER);
     let focus = GetFocus();
-    for (c, r) in [(u.fps, &tb.fps), (u.w, &tb.w), (u.h, &tb.h)] {
-        let enabled = IsWindowEnabled(c) != 0;
-        round_rect(
-            hdc,
-            r,
-            s(RADIUS),
-            if enabled { FIELD } else { FIELD_OFF },
-            STROKE,
-        );
-        let (line, thick) = if focus == c {
-            (ACCENT, s(2))
-        } else {
-            (FIELD_LINE, 1)
-        };
-        if enabled {
-            let bottom = RECT {
-                left: r.left + s(RADIUS) / 2,
-                top: r.bottom - thick,
-                right: r.right - s(RADIUS) / 2,
-                bottom: r.bottom,
-            };
-            fill(hdc, &bottom, line);
-        }
-    }
+    let (close_hot, close_down) = CLOSE.with(|c| c.get());
+    let title = get_text(hwnd);
+    let state = draw::Frame {
+        title: &title,
+        recording: recording(),
+        close_hot,
+        close_down,
+        fields_enabled: IsWindowEnabled(u.fps) != 0,
+        focus: match focus {
+            f if f == u.fps => Some(draw::Field::Fps),
+            f if f == u.w => Some(draw::Field::W),
+            f if f == u.h => Some(draw::Field::H),
+            _ => None,
+        },
+    };
+    draw::frame(hdc, &u.fonts, w, h, &state);
 
-    BitBlt(screen_dc, 0, 0, rc.right, rc.bottom, hdc, 0, 0, SRCCOPY);
-    SelectObject(hdc, old_font);
+    BitBlt(screen_dc, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
     SelectObject(hdc, old_bmp);
     DeleteObject(bmp);
     DeleteDC(hdc);
@@ -631,90 +353,24 @@ unsafe fn paint(hwnd: HWND) {
 
 /// Draws the Record and Recent buttons ourselves (via comctl6 custom draw),
 /// keeping their keyboard, focus and hover behavior.
-unsafe fn draw_button(u: &Ui, cd: &NMCUSTOMDRAW) -> LRESULT {
+unsafe fn custom_draw_button(u: &Ui, cd: &NMCUSTOMDRAW) -> LRESULT {
     if cd.dwDrawStage != CDDS_PREERASE {
         return CDRF_DODEFAULT as LRESULT;
     }
-    let (hdc, r, st) = (cd.hdc, cd.rc, cd.uItemState);
-    let button = cd.hdr.hwndFrom;
-    fill(hdc, &r, BG);
-    // Neutral, except Record turns solid red as the Stop button.
-    let stop = button == u.rec && recording();
-    let (bg, border, fg) = match () {
-        _ if st & CDIS_DISABLED != 0 => (OFF, OFF, OFF_TEXT),
-        _ if stop && st & CDIS_SELECTED != 0 => (RED_DOWN, RED_DOWN, FIELD),
-        _ if stop && st & CDIS_HOT != 0 => (RED_HOT, RED_HOT, FIELD),
-        _ if stop => (RED, RED, FIELD),
-        _ if st & CDIS_SELECTED != 0 => (BTN_DOWN, STROKE, SUBTLE),
-        _ if st & CDIS_HOT != 0 => (BTN_HOT, STROKE, TEXT),
-        _ => (BTN, STROKE, TEXT),
+    let st = cd.uItemState;
+    let kind = if cd.hdr.hwndFrom == u.rec {
+        draw::Button::Record
+    } else {
+        draw::Button::Recent
     };
-    round_rect(hdc, &r, scale(RADIUS, u.dpi), bg, border);
-    if st & CDIS_FOCUS != 0 && st & CDIS_SHOWKEYBOARDCUES != 0 {
-        let pen = CreatePen(PS_SOLID, scale(2, u.dpi), TEXT);
-        let (op, ob) = (
-            SelectObject(hdc, pen),
-            SelectObject(hdc, GetStockObject(NULL_BRUSH)),
-        );
-        let d = scale(RADIUS, u.dpi) * 2;
-        RoundRect(hdc, r.left + 1, r.top + 1, r.right, r.bottom, d, d);
-        SelectObject(hdc, op);
-        SelectObject(hdc, ob);
-        DeleteObject(pen);
-    }
-    let old = SelectObject(hdc, u.font);
-    let label = get_text(button);
-    // An icon in front of the label: Record's red dot (idle), Recent's clock.
-    let icon = match label.strip_prefix('●') {
-        Some(rest) if st & CDIS_DISABLED == 0 => Some(("●", u.font, RED, rest.to_string())),
-        _ if button == u.recent => Some(("\u{E81C}", u.icon_font, fg, format!("  {label}"))),
-        _ => None,
+    let state = draw::ButtonState {
+        hot: st & CDIS_HOT != 0,
+        pressed: st & CDIS_SELECTED != 0,
+        disabled: st & CDIS_DISABLED != 0,
+        keyboard_focus: st & CDIS_FOCUS != 0 && st & CDIS_SHOWKEYBOARDCUES != 0,
     };
-    match icon {
-        Some((glyph, font, color, rest)) => {
-            let width = |s: &str, f: HFONT| {
-                let w: Vec<u16> = s.encode_utf16().collect();
-                let mut m: RECT = mem::zeroed();
-                SelectObject(hdc, f);
-                DrawTextW(
-                    hdc,
-                    w.as_ptr(),
-                    w.len() as i32,
-                    &mut m,
-                    DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
-                );
-                m.right
-            };
-            let (icon_w, rest_w) = (width(glyph, font), width(&rest, u.font));
-            let left = r.left + (r.right - r.left - icon_w - rest_w) / 2;
-            SelectObject(hdc, font);
-            text(
-                hdc,
-                glyph,
-                &RECT {
-                    left,
-                    right: left + icon_w,
-                    ..r
-                },
-                color,
-                DT_LEFT,
-            );
-            SelectObject(hdc, u.font);
-            text(
-                hdc,
-                &rest,
-                &RECT {
-                    left: left + icon_w,
-                    right: r.right,
-                    ..r
-                },
-                fg,
-                DT_LEFT,
-            );
-        }
-        None => text(hdc, &label, &r, fg, DT_CENTER),
-    }
-    SelectObject(hdc, old);
+    let label = get_text(cd.hdr.hwndFrom);
+    draw::button(cd.hdc, &u.fonts, cd.rc, kind, &label, recording(), state);
     CDRF_SKIPDEFAULT as LRESULT
 }
 
@@ -731,6 +387,7 @@ unsafe fn copy_gif(u: &Ui, path: &Path, size: u64) {
 /// Menu of recent recordings above the Recent button; picking one copies it.
 unsafe fn show_recent(u: &Ui) {
     let gifs = recent::list();
+    let now = recent::now_ms();
     let menu = CreatePopupMenu();
     if gifs.is_empty() {
         AppendMenuW(
@@ -744,7 +401,7 @@ unsafe fn show_recent(u: &Ui) {
         // Text after a tab is right-aligned in its own column.
         let label = format!(
             "{}\t{}×{}  ·  {}",
-            recent::ago(g.stamp),
+            recent::ago(g.stamp, now),
             g.w,
             g.h,
             recent::size_label(g.size)
@@ -768,7 +425,7 @@ unsafe fn show_recent(u: &Ui) {
         menu,
         flags,
         r.right,
-        r.top - scale(4, u.dpi),
+        r.top - scale(4, u.fonts.dpi),
         0,
         u.hwnd,
         ptr::null(),
@@ -805,9 +462,8 @@ unsafe fn show_recent(u: &Ui) {
 /// Set the window (taskbar) title and repaint our drawn title bar.
 unsafe fn set_title(u: &Ui, title: &str) {
     set_text(u.hwnd, title);
-    let mut rc = client_rect(u.hwnd);
-    rc.bottom = scale(TITLEBAR, u.dpi);
-    InvalidateRect(u.hwnd, &rc, 0);
+    let r = layout::title(u.fonts.dpi, client_size(u.hwnd).0);
+    InvalidateRect(u.hwnd, &r, 0);
 }
 
 /// Red window border while recording (Windows 11; ignored elsewhere).
@@ -821,40 +477,10 @@ unsafe fn set_border(u: &Ui, color: Option<COLORREF>) {
     );
 }
 
-/// Our own frame: drag by the title bar, resize from the edges.
-unsafe fn hit_test(u: &Ui, lp: LPARAM) -> LRESULT {
-    let mut pt = POINT {
-        x: (lp & 0xFFFF) as i16 as i32,
-        y: ((lp >> 16) & 0xFFFF) as i16 as i32,
-    };
-    ScreenToClient(u.hwnd, &mut pt);
-    let rc = client_rect(u.hwnd);
-    let s = |v| scale(v, u.dpi);
-    let (left, right) = (pt.x < s(BORDER), pt.x >= rc.right - s(BORDER));
-    let (top, bottom) = (pt.y < s(4), pt.y >= rc.bottom - s(4));
-    let (near_left, near_right) = (pt.x < s(GRIP), pt.x >= rc.right - s(GRIP));
-    let (near_top, near_bottom) = (pt.y < s(GRIP), pt.y >= rc.bottom - s(GRIP));
-    let code = match () {
-        _ if (top && near_left) || (left && near_top) => HTTOPLEFT,
-        _ if (top && near_right) || (right && near_top) => HTTOPRIGHT,
-        _ if (bottom && near_left) || (left && near_bottom) => HTBOTTOMLEFT,
-        _ if (bottom && near_right) || (right && near_bottom) => HTBOTTOMRIGHT,
-        _ if top => HTTOP,
-        _ if bottom => HTBOTTOM,
-        _ if left => HTLEFT,
-        _ if right => HTRIGHT,
-        _ if contains(&close_rect(u, &rc), pt.x, pt.y) => HTCLIENT,
-        _ if pt.y < s(TITLEBAR) => HTCAPTION,
-        _ => HTCLIENT,
-    };
-    code as LRESULT
-}
-
 /// Update the close button's hover/pressed state, repainting it on change.
 unsafe fn set_close_state(u: &Ui, hot: bool, down: bool) {
     if CLOSE.with(|c| c.replace((hot, down))) != (hot, down) {
-        let rc = client_rect(u.hwnd);
-        InvalidateRect(u.hwnd, &close_rect(u, &rc), 0);
+        InvalidateRect(u.hwnd, &close_rect(u), 0);
     }
 }
 
@@ -913,10 +539,10 @@ unsafe fn start() {
         }
     });
     set_text(u.rec, "■  Stop");
-    for c in [u.fps, u.w, u.h] {
+    for c in [u.fps, u.w, u.h, u.recent] {
         EnableWindow(c, 0);
     }
-    set_border(&u, Some(RED));
+    set_border(&u, Some(draw::RED));
     InvalidateRect(u.hwnd, ptr::null(), 0);
     SetTimer(u.hwnd, TIMER, 100, None);
     update_title();
@@ -948,7 +574,7 @@ unsafe fn finish(res: EncodeResult) {
     });
     KillTimer(u.hwnd, TIMER);
     set_text(u.rec, "●  Record");
-    for c in [u.rec, u.fps, u.w, u.h] {
+    for c in [u.rec, u.fps, u.w, u.h, u.recent] {
         EnableWindow(c, 1);
     }
     set_border(&u, None);
@@ -991,8 +617,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ERASEBKGND => 1,
         // No system non-client area: the client covers the whole window.
         WM_NCCALCSIZE if wp != 0 => 0,
+        // DWM doesn't draw frames for layered windows, so the default handlers
+        // paint the classic thick frame over our edges on (de)activation.
+        WM_NCPAINT => 0,
+        WM_NCACTIVATE => DefWindowProcW(hwnd, msg, wp, -1),
         WM_NCHITTEST => match ui() {
-            Some(u) => hit_test(&u, lp),
+            Some(u) => {
+                let (x, y) = mouse_pos(lp);
+                let mut pt = POINT { x, y };
+                ScreenToClient(hwnd, &mut pt);
+                let (w, h) = client_size(hwnd);
+                layout::hit_test(u.fonts.dpi, w, h, pt.x, pt.y) as LRESULT
+            }
             None => DefWindowProcW(hwnd, msg, wp, lp),
         },
         WM_PAINT => {
@@ -1006,11 +642,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_GETMINMAXINFO => {
             if let Some(u) = ui() {
                 let mmi = &mut *(lp as *mut MINMAXINFO);
-                mmi.ptMinTrackSize = POINT {
-                    x: scale(450, u.dpi),
-                    y: scale(120, u.dpi),
-                };
-                mmi.ptMaxTrackSize = max_window();
+                let (min_w, min_h) = layout::min_window(u.fonts.dpi);
+                let (max_w, max_h) = screen_size();
+                mmi.ptMinTrackSize = POINT { x: min_w, y: min_h };
+                mmi.ptMaxTrackSize = POINT { x: max_w, y: max_h };
             }
             0
         }
@@ -1024,7 +659,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEMOVE => {
             if let Some(u) = ui() {
                 let (x, y) = mouse_pos(lp);
-                let hot = contains(&close_rect(&u, &client_rect(hwnd)), x, y);
+                let hot = layout::contains(&close_rect(&u), x, y);
                 let (was_hot, down) = CLOSE.with(|c| c.get());
                 if hot && !was_hot {
                     let mut tme = TRACKMOUSEEVENT {
@@ -1049,7 +684,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN => {
             if let Some(u) = ui() {
                 let (x, y) = mouse_pos(lp);
-                if contains(&close_rect(&u, &client_rect(hwnd)), x, y) {
+                if layout::contains(&close_rect(&u), x, y) {
                     SetCapture(hwnd);
                     set_close_state(&u, true, true);
                 } else {
@@ -1065,7 +700,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if down {
                     ReleaseCapture();
                     let (x, y) = mouse_pos(lp);
-                    let inside = contains(&close_rect(&u, &client_rect(hwnd)), x, y);
+                    let inside = layout::contains(&close_rect(&u), x, y);
                     set_close_state(&u, hot && inside, false);
                     if inside {
                         PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -1081,21 +716,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if (hdr.hwndFrom == u.rec || hdr.hwndFrom == u.recent)
                         && hdr.code == NM_CUSTOMDRAW =>
                 {
-                    draw_button(&u, &*(lp as *const NMCUSTOMDRAW))
+                    custom_draw_button(&u, &*(lp as *const NMCUSTOMDRAW))
                 }
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             }
         }
         WM_CTLCOLOREDIT => {
-            SetBkColor(wp as HDC, FIELD);
-            SetTextColor(wp as HDC, TEXT);
+            SetBkColor(wp as HDC, draw::FIELD);
+            SetTextColor(wp as HDC, draw::TEXT);
             GetStockObject(WHITE_BRUSH) as LRESULT
         }
         // Disabled edits ask for static colors.
         WM_CTLCOLORSTATIC => match ui() {
             Some(u) => {
-                SetBkColor(wp as HDC, FIELD_OFF);
-                SetTextColor(wp as HDC, OFF_TEXT);
+                SetBkColor(wp as HDC, draw::FIELD_OFF);
+                SetTextColor(wp as HDC, draw::OFF_TEXT);
                 u.field_off as LRESULT
             }
             None => DefWindowProcW(hwnd, msg, wp, lp),
@@ -1122,13 +757,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     InvalidateRect(hwnd, ptr::null(), 0);
                     if let (Some(u), false) = (ui(), busy()) {
                         let r = capture_region(&u);
-                        // Cap the hole so the whole window fits on screen; the
-                        // minimum is enforced by WM_GETMINMAXINFO.
-                        let (s, max) = (|v| scale(v, u.dpi), max_window());
-                        let w = get_num(u.w).unwrap_or(r.w).clamp(1, max.x - s(BORDER) * 2);
-                        let h = get_num(u.h)
-                            .unwrap_or(r.h)
-                            .clamp(1, max.y - s(TITLEBAR) - s(TOOLBAR));
+                        let num = |c, fallback| get_text(c).trim().parse().unwrap_or(fallback);
+                        // The minimum is enforced by WM_GETMINMAXINFO.
+                        let (w, h) = layout::clamp_hole(
+                            u.fonts.dpi,
+                            num(u.w, r.w),
+                            num(u.h, r.h),
+                            screen_size(),
+                        );
                         set_capture_size(w, h);
                         layout();
                     }
@@ -1151,12 +787,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DPICHANGED => {
             if let Some(mut u) = ui() {
-                DeleteObject(u.font);
-                DeleteObject(u.icon_font);
-                u.dpi = hiword(wp);
-                u.font = make_font(u.dpi);
-                u.icon_font = make_icon_font(u.dpi);
-                u.text_h = text_height(u.font);
+                u.fonts.delete();
+                u.fonts = Fonts::new(hiword(wp));
+                u.text_h = u.fonts.text_height();
                 UI.with(|c| c.set(Some(u)));
                 apply_font(&u);
                 let r = &*(lp as *const RECT);
