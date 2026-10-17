@@ -23,7 +23,13 @@ pub struct Region {
     pub h: i32,
 }
 
-pub fn run(r: Region, fps: u32, stop: Arc<AtomicBool>, frames: Arc<AtomicUsize>, tx: SyncSender<Msg>) {
+pub fn run(
+    r: Region,
+    fps: u32,
+    stop: Arc<AtomicBool>,
+    frames: Arc<AtomicUsize>,
+    tx: SyncSender<Msg>,
+) {
     unsafe {
         timeBeginPeriod(1);
         let screen = GetDC(ptr::null_mut());

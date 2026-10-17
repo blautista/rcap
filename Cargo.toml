@@ -4,22 +4,27 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gif = "0.13"
-color_quant = "1.1"
+gif = "0.14"
+color_quant = "2"
 rayon = "1"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+embed-resource = "3"
 
 [profile.dev.package."*"]
 opt-level = 3

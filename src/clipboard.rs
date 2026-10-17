@@ -23,7 +23,12 @@ pub fn copy_file(hwnd: HWND, path: &Path) -> bool {
         let p = GlobalLock(drop) as *mut u8;
         ptr::write_unaligned(
             p as *mut DROPFILES,
-            DROPFILES { pFiles: header as u32, pt: POINT { x: 0, y: 0 }, fNC: 0, fWide: 1 },
+            DROPFILES {
+                pFiles: header as u32,
+                pt: POINT { x: 0, y: 0 },
+                fNC: 0,
+                fWide: 1,
+            },
         );
         ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, p.add(header), wide.len() * 2);
         GlobalUnlock(drop);
