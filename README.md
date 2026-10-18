@@ -8,7 +8,7 @@ already on your clipboard, ready to paste into Discord, Slack, etc.
 
 ## Install
 
-Download `rcap-vX.Y.Z.exe` from the [Releases](../../releases) page and run it.
+Download `rcap-X.Y.Z.exe` from the [Releases](../../releases) page and run it.
 There's nothing to install.
 
 Windows may show "Windows protected your PC" because the exe isn't signed.
@@ -49,7 +49,7 @@ Run the tests with `cargo test`.
 1. Bump `version` in `Cargo.toml` (e.g. `0.2.0`) and push to GitHub.
 2. Go to **Actions → Release → Run workflow** and click **Run workflow**.
 
-A few minutes later release `v0.2.0` shows up on the Releases page with the
+A few minutes later release `0.2.0` shows up on the Releases page with the
 exe attached. The version always comes from `Cargo.toml`, so the exe's
 version info matches the release. Each version can only be released once.
 

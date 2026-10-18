@@ -17,7 +17,7 @@ jobs:
         id: version
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          "tag=v$v" >> $env:GITHUB_OUTPUT
+          "tag=$v" >> $env:GITHUB_OUTPUT
 
       - name: Test
         run: cargo test --release
