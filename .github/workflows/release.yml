@@ -1,7 +1,12 @@
 name: Release
 
-# Run manually from the Actions tab. Releases the version in Cargo.toml.
+# Releases the version in Cargo.toml. Runs by itself when a push to master
+# touches Cargo.toml (does nothing if that version is already released), or
+# manually from the Actions tab.
 on:
+  push:
+    branches: [master]
+    paths: [Cargo.toml]
   workflow_dispatch:
 
 permissions:
@@ -15,17 +20,28 @@ jobs:
 
       - name: Read version
         id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           "tag=$v" >> $env:GITHUB_OUTPUT
+          gh release view $v *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "Release $v already exists; nothing to do."
+            "exists=true" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
 
       - name: Test
+        if: steps.version.outputs.exists != 'true'
         run: cargo test --release
 
       - name: Build
+        if: steps.version.outputs.exists != 'true'
         run: cargo build --release
 
       - name: Create release
+        if: steps.version.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}

@@ -46,12 +46,13 @@ Run the tests with `cargo test`.
 
 ## Make a release
 
-1. Bump `version` in `Cargo.toml` (e.g. `0.2.0`) and push to GitHub.
-2. Go to **Actions → Release → Run workflow** and click **Run workflow**.
+Bump `version` in `Cargo.toml` (e.g. `0.3.0`) and push to `master`.
 
-A few minutes later release `0.2.0` shows up on the Releases page with the
-exe attached. The version always comes from `Cargo.toml`, so the exe's
-version info matches the release. Each version can only be released once.
+The Release workflow starts by itself, runs the tests, and a few minutes later
+release `0.3.0` shows up on the Releases page with the exe attached. The
+version always comes from `Cargo.toml`, so the exe's version info matches the
+release. Pushes that don't change the version don't release anything. You can
+also start it by hand from **Actions → Release → Run workflow**.
 
 ## Privacy
 
