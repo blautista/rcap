@@ -109,7 +109,7 @@ fn main() {
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinst;
         wc.hCursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
-        wc.hIcon = LoadIconW(hinst, 1 as _); // assets/rcap.rc
+        wc.hIcon = LoadIconW(hinst, 1 as _); // icon resource from build.rs
         wc.lpszClassName = class.as_ptr();
         RegisterClassW(&wc);
 

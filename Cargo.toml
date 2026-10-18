@@ -2,6 +2,9 @@
 name = "rcap"
 version = "0.1.0"
 edition = "2021"
+description = "Screen to GIF recorder"
+license = "MIT"
+repository = "https://github.com/blautista/rcap"
 
 [dependencies]
 gif = "0.14"

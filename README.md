@@ -46,9 +46,20 @@ Run the tests with `cargo test`.
 
 ## Make a release
 
-1. Push your changes to GitHub.
-2. Go to **Actions → Release → Run workflow**.
-3. Enter a version like `v0.2.0` and click **Run workflow**.
+1. Bump `version` in `Cargo.toml` (e.g. `0.2.0`) and push to GitHub.
+2. Go to **Actions → Release → Run workflow** and click **Run workflow**.
 
-A few minutes later the release shows up on the Releases page with the exe
-attached. Each version can only be released once.
+A few minutes later release `v0.2.0` shows up on the Releases page with the
+exe attached. The version always comes from `Cargo.toml`, so the exe's
+version info matches the release. Each version can only be released once.
+
+## Privacy
+
+This program will not transfer any information to other networked systems
+unless specifically requested by the user or the person installing or
+operating it. Recordings are saved only to your temp folder
+(`%TEMP%\rcap`, newest 10 kept) and your clipboard.
+
+## License
+
+[MIT](LICENSE)
